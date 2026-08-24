@@ -1,0 +1,403 @@
+# Binwalk Windows Smart Build
+# Windows "auto-version-tracking + auto-publish + auto-cleanup" workflow.
+# Modes: schedule (daily auto-track, smart skip) / workflow_dispatch (manual, release|latest|custom).
+#
+# Adapted from vaultwarden-windows-smart-build (same architecture), with:
+#   - upstream switched to ReFirmLabs/binwalk (Rust rewrite, v3.x)
+#   - dropped web-vault download/cache block (N/A)
+#   - dropped vcpkg/OpenSSL machinery (no TLS deps; xz2/bzip2 vendor C sources,
+#     compiled by cc under MSVC — windows-latest runners ship VS)
+#   - CLI smoke adapted: `binwalk.exe --help` must exit 0 within bounds
+
+name: Binwalk Windows Smart Build
+
+on:
+  schedule:
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+    inputs:
+      tag_choice:
+        description: "Version selection"
+        required: true
+        default: release
+        type: choice
+        options: [release, latest, custom]
+      tag:
+        description: "Custom ref (commit/tag/branch) — used when tag_choice=custom"
+        required: false
+        default: ""
+      dry_run:
+        description: "Check only (no build)"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: bw-${{ github.event.inputs.tag_choice || 'release' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: ReFirmLabs/binwalk
+  RELEASE_PREFIX: bw-win-
+
+jobs:
+  # ---------- Decision layer (cheap ubuntu) ----------
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      should_build: ${{ steps.version_check.outputs.should_build }}
+      target_tag: ${{ steps.target_version.outputs.target_tag }}
+      mode: ${{ steps.resolve.outputs.mode }}
+      upstream_version: ${{ steps.target_version.outputs.upstream_version }}
+      latest_tag: ${{ steps.get_latest.outputs.latest_tag }}
+      target_sha: ${{ steps.deref_sha.outputs.target_sha }}
+    steps:
+      - name: Resolve inputs
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INP_TAG_CHOICE: ${{ github.event.inputs.tag_choice }}
+          INP_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            mode="release"; custom=""
+          else
+            mode="${INP_TAG_CHOICE:-release}"
+            case "$mode" in release|latest|custom) ;; *) mode="release" ;; esac
+            custom="${INP_TAG:-}"
+          fi
+          { echo "mode=$mode"; echo "custom=$custom"; } >> "$GITHUB_OUTPUT"
+
+      - name: Get latest upstream tag
+        id: get_latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          r=$(curl -fsSL --retry 3 --retry-delay 3 \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "User-Agent: bw-smart" \
+                "https://api.github.com/repos/$UPSTREAM/releases/latest")
+          tag=$(printf '%s' "$r" | jq -r '.tag_name // empty')
+          [ -n "$tag" ] || { echo "::error::upstream latest release has no tag_name"; exit 1; }
+          echo "latest_tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve target version
+        id: target_version
+        env:
+          MODE: ${{ steps.resolve.outputs.mode }}
+          CUSTOM: ${{ steps.resolve.outputs.custom }}
+          LATEST_TAG: ${{ steps.get_latest.outputs.latest_tag }}
+        run: |
+          set -euo pipefail
+          case "$MODE" in
+            release)
+              [ -n "$LATEST_TAG" ] || { echo "::error::no upstream release for release mode"; exit 1; }
+              echo "target_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+              echo "upstream_version=${LATEST_TAG#v}" >> "$GITHUB_OUTPUT"
+              ;;
+            latest)
+              echo "target_tag=" >> "$GITHUB_OUTPUT"
+              echo "upstream_version=main" >> "$GITHUB_OUTPUT"
+              ;;
+            custom)
+              t="$CUSTOM"
+              [ -n "$t" ] || { echo "::error::custom tag required"; exit 1; }
+              printf '%s' "$t" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$' \
+                || { echo "::error::custom ref has invalid characters"; exit 1; }
+              printf '%s' "$t" | grep -Eq '\.\.|//' \
+                && { echo "::error::custom ref looks like path traversal"; exit 1; } || true
+              echo "target_tag=$t" >> "$GITHUB_OUTPUT"
+              echo "upstream_version=custom" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+      - name: Resolve target commit sha
+        id: deref_sha
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.target_version.outputs.target_tag }}
+        run: |
+          set -euo pipefail
+          ref=$(curl -fsSL --retry 3 --retry-delay 3 \
+                  -H "Authorization: Bearer $GH_TOKEN" -H "User-Agent: bw-smart" \
+                  "https://api.github.com/repos/$UPSTREAM/git/ref/tags/$(printf '%s' "$TAG" | sed 's/[&/\]/\\&/g')")
+          otype=$(printf '%s' "$ref" | jq -r '.object.type')
+          osha=$(printf '%s' "$ref"   | jq -r '.object.sha')
+          if [ "$otype" = "tag" ]; then
+            to=$(curl -fsSL --retry 3 --retry-delay 3 \
+                   -H "Authorization: Bearer $GH_TOKEN" -H "User-Agent: bw-smart" \
+                   "https://api.github.com/repos/$UPSTREAM/git/tags/$osha")
+            commit=$(printf '%s' "$to" | jq -r '.object.sha')
+          else
+            commit="$osha"
+          fi
+          [ -n "$commit" ] || { echo "::error::cannot resolve commit sha for $TAG"; exit 1; }
+          echo "target_sha=${commit:0:12}" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether to build
+        id: version_check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          VER: ${{ steps.target_version.outputs.upstream_version }}
+          SHA: ${{ steps.deref_sha.outputs.target_sha }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          should=true; reason="manual"
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            found=false
+            for p in 1 2 3 4 5; do
+              j=$(curl -fsSL --retry 3 --retry-delay 3 \
+                    -H "Authorization: Bearer $GH_TOKEN" -H "User-Agent: bw-smart" \
+                    "https://api.github.com/repos/$REPO/releases?per_page=100&page=$p" || echo '[]')
+              if printf '%s' "$j" | jq -r '.[].tag_name' \
+                   | grep -Eq "^${RELEASE_PREFIX}v?${VER}.*-${SHA}(-|$)"; then
+                found=true; break
+              fi
+              n=$(printf '%s' "$j" | jq 'length')
+              [ "$n" -lt 100 ] && break
+            done
+            if [ "$found" = true ]; then should=false; reason="already built ($VER @ $SHA)"; else should=true; reason="new ($VER @ $SHA)"; fi
+          fi
+          if [ "${DRY_RUN:-false}" = true ]; then should=false; reason="$reason [dry-run]"; fi
+          echo "::notice::decision: should_build=$should reason=$reason"
+          echo "should_build=$should" >> "$GITHUB_OUTPUT"
+
+  # ---------- Execution layer (windows) ----------
+  build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    env:
+      MODE: ${{ needs.check.outputs.mode }}
+    steps:
+      - name: Checkout binwalk source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ReFirmLabs/binwalk
+          ref: ${{ needs.check.outputs.target_tag }}
+          persist-credentials: false
+
+      - name: Install Rust stable
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: false
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: . -> target
+          shared-key: bw-rust-win-v1
+          cache-bin: false
+          save-if: ${{ env.MODE == 'release' }}
+
+      # xz2/bzip2 vendor their C sources and compile via cc under MSVC;
+      # windows-latest ships VS — no vcpkg needed.
+      - name: Build
+        shell: pwsh
+        env:
+          RUSTFLAGS: "-Cstrip=debuginfo"
+        run: cargo build --locked --release
+
+      - name: Get version
+        id: get_version
+        shell: pwsh
+        run: |
+          $describe = (git describe --tags --always --long 2>$null)
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($describe)) { $describe = "" }
+          $sha = (git rev-parse --short=12 HEAD).Trim()
+          $ver = $null
+          if ($describe -match '^(\d+\.\d+(?:\.\d+)?(?:-[A-Za-z0-9.]+)?)(?:-\d+-g[0-9a-f]+)?$') {
+            $ver = "v" + $matches[1]
+          }
+          if (-not $ver) { $ver = "dev" }
+          "binwalk_version=$ver" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "binwalk_short_sha=$sha" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Move-Item -Force .\target\release\binwalk.exe $env:GITHUB_WORKSPACE\binwalk.exe
+
+      # Smoke: valid PE + size floor + `--help` exits 0 within 10s.
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $exe = "binwalk.exe"
+          $size = (Get-Item $exe).Length
+          if ($size -lt 2MB) { throw "binary suspiciously small: $size bytes" }
+          $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $exe))
+          if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) { throw "invalid PE: MZ header missing" }
+          $outLog = Join-Path $env:TEMP "bw_smoke_out.log"; $errLog = Join-Path $env:TEMP "bw_smoke_err.log"
+          Remove-Item $outLog,$errLog -ErrorAction SilentlyContinue
+          $p = Start-Process -FilePath ".\$exe" -ArgumentList "--help" -PassThru -WindowStyle Hidden `
+                 -RedirectStandardOutput $outLog -RedirectStandardError $errLog
+          if (-not $p.WaitForExit(10000)) {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            throw "binwalk.exe --help hung beyond 10s"
+          }
+          if ($p.ExitCode -ne 0) {
+            Write-Host "--- stdout ---"; Get-Content $outLog -ErrorAction SilentlyContinue
+            Write-Host "--- stderr ---"; Get-Content $errLog -ErrorAction SilentlyContinue
+            throw "binwalk.exe --help exited $($p.ExitCode)"
+          }
+          $text = Get-Content $outLog -Raw
+          if ($text -notmatch 'Usage|usage') { throw "smoke output missing usage text" }
+          Write-Host "Smoke OK: valid PE, --help exited 0 with usage text"
+
+      - name: Package with 7z
+        shell: pwsh
+        run: |
+          7z a -tzip -mx=9 binwalk.zip binwalk.exe LICENSE*
+          if ($LASTEXITCODE -gt 1) { throw "7z packaging failed with exit code $LASTEXITCODE" }
+          $mb = [math]::Round((Get-Item binwalk.zip).Length / 1MB, 2)
+          "ZIP_SIZE_MB=$mb" | Out-File $env:GITHUB_ENV -Append
+          $hash = (Get-FileHash binwalk.zip -Algorithm SHA256).Hash.ToLower()
+          "ZIP_SHA256=$hash" | Out-File $env:GITHUB_ENV -Append
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: binwalk-${{ steps.get_version.outputs.binwalk_version }}-${{ steps.get_version.outputs.binwalk_short_sha }}
+          path: binwalk.zip
+          retention-days: 14
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Compute release tag
+        id: set_release_tag
+        shell: bash
+        env:
+          VER: ${{ steps.get_version.outputs.binwalk_version }}
+          SHA: ${{ steps.get_version.outputs.binwalk_short_sha }}
+          MODE: ${{ env.MODE }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          case "$MODE" in
+            release)
+              echo "release_tag=${RELEASE_PREFIX}${VER}-${SHA}-r${RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+              echo "make_latest=true"  >> "$GITHUB_OUTPUT"
+              echo "prerelease=false"  >> "$GITHUB_OUTPUT" ;;
+            latest|custom)
+              echo "release_tag=${RELEASE_PREFIX}${VER}-${SHA}-${MODE}-r${RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+              echo "make_latest=false" >> "$GITHUB_OUTPUT"
+              echo "prerelease=true"   >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::unknown mode $MODE"; exit 1 ;;
+          esac
+
+      - name: Create Release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.set_release_tag.outputs.release_tag }}
+          name: Binwalk ${{ steps.get_version.outputs.binwalk_version }} (Windows)
+          body: |
+            ### binwalk ${{ steps.get_version.outputs.binwalk_version }} (Windows · MSVC · Rust v3 engine)
+
+            - **Commit**: `${{ steps.get_version.outputs.binwalk_short_sha }}`
+            - **Mode**: `${{ env.MODE }}`
+            - **Size**: `${{ env.ZIP_SIZE_MB }} MB`
+            - **SHA256**: `${{ env.ZIP_SHA256 }}`
+
+            Scope note: full signature scanning; extraction backends partially
+            depend on external tools not shipped here.
+          files: binwalk.zip
+          make_latest: ${{ steps.set_release_tag.outputs.make_latest }}
+          prerelease: ${{ steps.set_release_tag.outputs.prerelease }}
+          fail_on_unmatched_files: true
+
+      - name: Cleanup old releases
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          CURRENT_TAG: ${{ steps.set_release_tag.outputs.release_tag }}
+        run: |
+          $h = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; "User-Agent" = "bw-smart"; Accept = "application/vnd.github+json" }
+          $CUR  = $env:CURRENT_TAG
+          $KEEP = 8
+          $all = @()
+          for ($p = 1; $p -le 20; $p++) {
+            $r = Invoke-RestMethod "https://api.github.com/repos/$env:REPO/releases?per_page=100&page=$p" -Headers $h -ErrorAction SilentlyContinue
+            if (-not $r) { break }
+            $all += ($r | Where-Object { $_.tag_name -like "$RELEASE_PREFIX*" })
+            if ($r.Count -lt 100) { break }
+            Start-Sleep -Milliseconds 200
+          }
+          Write-Host "total bw-win-* releases: $($all.Count)"
+          if ($all.Count -eq 0) { exit 0 }
+          function KeyOf($t) {
+            if ($t -match '^bw-win-(.+?)-([0-9a-f]{12})(?:-(release|latest|custom))?(?:-r\d+)?$') {
+              return "$($matches[1])|$($matches[2])"
+            }
+            return $null
+          }
+          function DeleteRel($x) {
+            try { Invoke-RestMethod -Method Delete "https://api.github.com/repos/$env:REPO/releases/$($x.id)" -Headers $h | Out-Null } catch { return $false }
+            try { Invoke-RestMethod -Method Delete "https://api.github.com/repos/$env:REPO/git/refs/tags/$($x.tag_name)" -Headers $h | Out-Null } catch {}
+            return $true
+          }
+          $deleted = 0
+          $groups = $all | Where-Object { KeyOf $_.tag_name } | Group-Object { KeyOf $_.tag_name }
+          foreach ($g in $groups) {
+            if ($g.Group.Count -le 1) { continue }
+            $sorted = $g.Group | Sort-Object published_at -Descending
+            for ($i = 1; $i -lt $sorted.Count; $i++) {
+              if ($sorted[$i].tag_name -eq $CUR) { continue }
+              if (DeleteRel $sorted[$i]) { Write-Host "  dedup deleted: $($sorted[$i].tag_name)"; $deleted++ }
+            }
+          }
+          $pre = $all | Where-Object { $_.prerelease } | Sort-Object published_at -Descending
+          if ($pre.Count -gt $KEEP) {
+            for ($i = $KEEP; $i -lt $pre.Count; $i++) {
+              if ($pre[$i].tag_name -eq $CUR) { continue }
+              if (DeleteRel $pre[$i]) { Write-Host "  cap deleted: $($pre[$i].tag_name)"; $deleted++ }
+            }
+          }
+          Write-Host "========== cleanup done: deleted $deleted releases =========="
+
+  notify:
+    needs: [check, build]
+    if: always() && (needs.check.result == 'failure' || needs.build.result == 'failure') && github.event_name != 'workflow_run'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      issues: write
+      contents: read
+    steps:
+      - name: Open or update failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set +e
+          TITLE="🚨 Binwalk Windows build FAILED"
+          URL="https://github.com/$REPO/actions/runs/$RUN_ID"
+          NUM=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+                  "https://api.github.com/repos/$REPO/issues?state=open" \
+                | jq -r --arg t "$TITLE" '.[] | select(.title==$t) | .number' | head -n1)
+          BODY="Build failed at $URL (run #$RUN_ID)."
+          PAYLOAD=$(jq -nc --arg b "$BODY" '{body:$b}')
+          if [ -n "$NUM" ]; then
+            curl -fsSL -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/issues/$NUM/comments" -d "$PAYLOAD" >/dev/null
+          else
+            CREATE=$(jq -nc --arg t "$TITLE" --arg b "$BODY" '{title:$t,body:$b}')
+            curl -fsSL -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/issues" -d "$CREATE" >/dev/null
+          fi
+          exit 0

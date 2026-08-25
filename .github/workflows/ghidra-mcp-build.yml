@@ -1,68 +1,330 @@
-name: Build with Maven (Ghidra 12.1.3)
+name: GhidraMCP Smart Build
 
 on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+  schedule:
+    - cron: '0 18 * * *'
   workflow_dispatch:
+    inputs:
+      tag_choice:
+        description: "GhidraMCP version selection"
+        required: true
+        default: release
+        type: choice
+        options: [release, latest, custom]
+      tag:
+        description: "Custom ref (commit/tag/branch) — used when tag_choice=custom"
+        required: false
+        default: ""
+      dry_run:
+        description: "Check only (no build)"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: gm-${{ github.event.inputs.tag_choice || 'release' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: LaurieWired/GhidraMCP
+  RELEASE_PREFIX: gm-win-
+  # target Ghidra version
+  GHIDRA_VERSION: 12.1.3
+  GHIDRA_DATE: 20260817
 
 jobs:
-  build:
+  check:
     runs-on: ubuntu-latest
-    env:
-      GHIDRA_VERSION: 12.1.3
-      GHIDRA_DATE: 20260817
-      GHIDRA_LIBS: >-
-        Features/Base/lib/Base.jar
-        Features/Decompiler/lib/Decompiler.jar
-        Framework/Docking/lib/Docking.jar
-        Framework/Generic/lib/Generic.jar
-        Framework/Project/lib/Project.jar
-        Framework/SoftwareModeling/lib/SoftwareModeling.jar
-        Framework/Utility/lib/Utility.jar
-        Framework/Gui/lib/Gui.jar
-
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      should_build: ${{ steps.version_check.outputs.should_build }}
+      target_tag: ${{ steps.target_version.outputs.target_tag }}
+      mode: ${{ steps.resolve.outputs.mode }}
+      upstream_version: ${{ steps.target_version.outputs.upstream_version }}
+      latest_tag: ${{ steps.get_latest.outputs.latest_tag }}
+      target_sha: ${{ steps.deref_sha.outputs.target_sha }}
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up JDK 21
-      uses: actions/setup-java@v4
-      with:
-        java-version: '21'
-        distribution: 'temurin'
-        cache: maven
+      - name: Resolve inputs
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INP_TAG_CHOICE: ${{ github.event.inputs.tag_choice }}
+          INP_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            mode="release"; custom=""
+          else
+            mode="${INP_TAG_CHOICE:-release}"
+            case "$mode" in release|latest|custom) ;; *) mode="release" ;; esac
+            custom="${INP_TAG:-}"
+          fi
+          { echo "mode=$mode"; echo "custom=$custom"; } >> "$GITHUB_OUTPUT"
 
-    - name: Download Ghidra
-      run: |
-        wget --no-verbose -O ghidra.zip https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${{ env.GHIDRA_VERSION }}_PUBLIC/ghidra_${{ env.GHIDRA_VERSION }}_PUBLIC_${{ env.GHIDRA_DATE }}.zip
-        7z x -bd ghidra.zip
+      - name: Get latest upstream tag
+        id: get_latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          r=$(curl -fsSL --retry 3 --retry-delay 3 \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "User-Agent: gm-smart" \
+                "https://api.github.com/repos/$UPSTREAM/releases/latest")
+          tag=$(printf '%s' "$r" | jq -r '.tag_name // empty')
+          [ -n "$tag" ] || { echo "::error::upstream latest release has no tag_name"; exit 1; }
+          echo "latest_tag=$tag" >> "$GITHUB_OUTPUT"
 
-    - name: Copy Ghidra libs
-      run: |
-        mkdir -p ./lib
-        for libfile in ${{ env.GHIDRA_LIBS }}
-          do echo "Copying ${libfile} to lib/"
-          cp ghidra_${{ env.GHIDRA_VERSION }}_PUBLIC/Ghidra/${libfile} ./lib/
-        done
+      - name: Resolve target version
+        id: target_version
+        env:
+          MODE: ${{ steps.resolve.outputs.mode }}
+          CUSTOM: ${{ steps.resolve.outputs.custom }}
+          LATEST_TAG: ${{ steps.get_latest.outputs.latest_tag }}
+        run: |
+          set -euo pipefail
+          case "$MODE" in
+            release)
+              [ -n "$LATEST_TAG" ] || { echo "::error::no upstream release for release mode"; exit 1; }
+              echo "target_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+              echo "upstream_version=${LATEST_TAG#v}" >> "$GITHUB_OUTPUT"
+              ;;
+            latest)
+              echo "target_tag=" >> "$GITHUB_OUTPUT"
+              echo "upstream_version=master" >> "$GITHUB_OUTPUT"
+              ;;
+            custom)
+              t="$CUSTOM"
+              [ -n "$t" ] || { echo "::error::custom tag required"; exit 1; }
+              printf '%s' "$t" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$' \
+                || { echo "::error::custom ref has invalid characters"; exit 1; }
+              printf '%s' "$t" | grep -Eq '\.\.|//' \
+                && { echo "::error::custom ref looks like path traversal"; exit 1; } || true
+              echo "target_tag=$t" >> "$GITHUB_OUTPUT"
+              echo "upstream_version=custom" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
 
-    - name: Patch extension.properties for target Ghidra
-      run: |
-        sed -i 's/^ghidraVersion=.*/ghidraVersion=${{ env.GHIDRA_VERSION }}/' src/main/resources/extension.properties
-        echo "--- patched ---"
-        cat src/main/resources/extension.properties
+      - name: Resolve target commit sha
+        id: deref_sha
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.target_version.outputs.target_tag }}
+        run: |
+          set -euo pipefail
+          ref=$(curl -fsSL --retry 3 --retry-delay 3 \
+                  -H "Authorization: Bearer $GH_TOKEN" -H "User-Agent: gm-smart" \
+                  "https://api.github.com/repos/$UPSTREAM/git/ref/tags/$(printf '%s' "$TAG" | sed 's/[&/\]/\\&/g')")
+          otype=$(printf '%s' "$ref" | jq -r '.object.type')
+          osha=$(printf '%s' "$ref"   | jq -r '.object.sha')
+          if [ "$otype" = "tag" ]; then
+            to=$(curl -fsSL --retry 3 --retry-delay 3 \
+                   -H "Authorization: Bearer $GH_TOKEN" -H "User-Agent: gm-smart" \
+                   "https://api.github.com/repos/$UPSTREAM/git/tags/$osha")
+            commit=$(printf '%s' "$to" | jq -r '.object.sha')
+          else
+            commit="$osha"
+          fi
+          [ -n "$commit" ] || { echo "::error::cannot resolve commit sha for $TAG"; exit 1; }
+          echo "target_sha=${commit:0:12}" >> "$GITHUB_OUTPUT"
 
-    - name: Build with Maven
-      run: mvn clean package assembly:single
+      - name: Decide whether to build
+        id: version_check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          VER: ${{ steps.target_version.outputs.upstream_version }}
+          SHA: ${{ steps.deref_sha.outputs.target_sha }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          should=true; reason="manual"
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            found=false
+            for p in 1 2 3 4 5; do
+              j=$(curl -fsSL --retry 3 --retry-delay 3 \
+                    -H "Authorization: Bearer $GH_TOKEN" -H "User-Agent: gm-smart" \
+                    "https://api.github.com/repos/$REPO/releases?per_page=100&page=$p" || echo '[]')
+              if printf '%s' "$j" | jq -r '.[].tag_name' \
+                   | grep -Eq "^${RELEASE_PREFIX}v?${VER}.*-${SHA}(-|$)"; then
+                found=true; break
+              fi
+              n=$(printf '%s' "$j" | jq 'length')
+              [ "$n" -lt 100 ] && break
+            done
+            if [ "$found" = true ]; then should=false; reason="already built ($VER @ $SHA)"; else should=true; reason="new ($VER @ $SHA)"; fi
+          fi
+          if [ "${DRY_RUN:-false}" = true ]; then should=false; reason="$reason [dry-run]"; fi
+          echo "::notice::decision: should_build=$should reason=$reason"
+          echo "should_build=$should" >> "$GITHUB_OUTPUT"
 
-    - name: Assemble release directory
-      run: |
-        mkdir release
-        cp target/GhidraMCP-*-SNAPSHOT.zip release/GhidraMCP-12.1.3.zip
-        cp bridge_mcp_ghidra.py release/
+  build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      MODE: ${{ needs.check.outputs.mode }}
+    steps:
+      - name: Checkout GhidraMCP source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: LaurieWired/GhidraMCP
+          ref: ${{ needs.check.outputs.target_tag }}
+          persist-credentials: false
 
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: GhidraMCP-artifact-12.1.3
-        path: |
-          release/*
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Download Ghidra 12.1.3
+        run: |
+          wget --no-verbose -O ghidra.zip \
+            https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${{ env.GHIDRA_VERSION }}_PUBLIC/ghidra_${{ env.GHIDRA_VERSION }}_PUBLIC_${{ env.GHIDRA_DATE }}.zip
+          7z x -bd ghidra.zip
+
+      - name: Copy Ghidra libs
+        run: |
+          mkdir -p ./lib
+          for libfile in ${{ env.GHIDRA_LIBS }}
+            do echo "Copying ${libfile} to lib/"
+            cp ghidra_${{ env.GHIDRA_VERSION }}_PUBLIC/Ghidra/${libfile} ./lib/
+          done
+
+      - name: Patch extension.properties
+        run: |
+          sed -i 's/^ghidraVersion=.*/ghidraVersion=${{ env.GHIDRA_VERSION }}/' src/main/resources/extension.properties
+          echo "--- patched ---"
+          cat src/main/resources/extension.properties
+
+      - name: Build with Maven
+        run: mvn clean package assembly:single
+
+      - name: Structural gate
+        run: |
+          zippath=$(ls target/GhidraMCP-*-SNAPSHOT.zip | head -n1)
+          echo "artifact: $zippath"
+          7z l "$zippath" | grep -q 'extension.properties' || { echo "::error::missing extension.properties"; exit 1; }
+          7z l "$zippath" | grep -q 'lib/GhidraMCP.jar'  || { echo "::error::missing lib/GhidraMCP.jar"; exit 1; }
+
+      - name: Assemble release directory
+        run: |
+          mkdir -p release
+          cp target/GhidraMCP-*-SNAPSHOT.zip release/GhidraMCP-12.1.3.zip
+          cp bridge_mcp_ghidra.py release/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: GhidraMCP-artifact-12.1.3-${{ needs.check.outputs.target_sha }}
+          path: |
+            release/*
+          retention-days: 14
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Compute release tag
+        id: set_release_tag
+        shell: bash
+        env:
+          VER: ${{ steps.target_version.outputs.upstream_version }}
+          SHA: ${{ needs.check.outputs.target_sha }}
+          MODE: ${{ env.MODE }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          case "$MODE" in
+            release)
+              echo "release_tag=${RELEASE_PREFIX}${VER}-${SHA}-r${RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+              echo "make_latest=false" >> "$GITHUB_OUTPUT"
+              echo "prerelease=false"  >> "$GITHUB_OUTPUT" ;;
+            latest|custom)
+              echo "release_tag=${RELEASE_PREFIX}${VER}-${SHA}-${MODE}-r${RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+              echo "make_latest=false" >> "$GITHUB_OUTPUT"
+              echo "prerelease=true"   >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::unknown mode $MODE"; exit 1 ;;
+          esac
+
+      - name: Create Release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.set_release_tag.outputs.release_tag }}
+          name: GhidraMCP ${{ steps.target_version.outputs.upstream_version }} (for Ghidra 12.1.3)
+          files: release/*
+          make_latest: ${{ steps.set_release_tag.outputs.make_latest }}
+          prerelease: ${{ steps.set_release_tag.outputs.prerelease }}
+          fail_on_unmatched_files: true
+
+      - name: Cleanup old releases
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          CURRENT_TAG: ${{ steps.set_release_tag.outputs.release_tag }}
+        run: |
+          $h = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; "User-Agent" = "gm-smart"; Accept = "application/vnd.github+json" }
+          $CUR  = $env:CURRENT_TAG
+          $KEEP = 5
+          $all = @()
+          for ($p = 1; $p -le 10; $p++) {
+            $r = Invoke-RestMethod "https://api.github.com/repos/$env:REPO/releases?per_page=100&page=$p" -Headers $h -ErrorAction SilentlyContinue
+            if (-not $r) { break }
+            $all += ($r | Where-Object { $_.tag_name -like "$env:RELEASE_PREFIX*" })
+            if ($r.Count -lt 100) { break }
+          }
+          Write-Host "total gm-win-* releases: $($all.Count)"
+          if ($all.Count -le $KEEP) { exit 0 }
+          $old = $all | Sort-Object published_at -Descending | Select-Object -Skip $KEEP
+          foreach ($x in $old) {
+            if ($x.tag_name -eq $CUR) { continue }
+            try { Invoke-RestMethod -Method Delete "https://api.github.com/repos/$env:REPO/releases/$($x.id)" -Headers $h | Out-Null } catch {}
+            try { Invoke-RestMethod -Method Delete "https://api.github.com/repos/$env:REPO/git/refs/tags/$($x.tag_name)" -Headers $h | Out-Null } catch {}
+            Write-Host "cap deleted: $($x.tag_name)"
+          }
+
+  notify:
+    needs: [check, build]
+    if: always() && (needs.check.result == 'failure') && github.event_name != 'workflow_run'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      issues: write
+      contents: read
+    steps:
+      - name: Open or update failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set +e
+          TITLE="🚨 GhidraMCP build FAILED"
+          URL="https://github.com/$REPO/actions/runs/$RUN_ID"
+          NUM=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+                  "https://api.github.com/repos/$REPO/issues?state=open" \
+                | jq -r --arg t "$TITLE" '.[] | select(.title==$t) | .number' | head -n1)
+          BODY="Build failed at $URL (run #$RUN_ID)."
+          PAYLOAD=$(jq -nc --arg b "$BODY" '{body:$b}')
+          if [ -n "$NUM" ]; then
+            curl -fsSL -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/issues/$NUM/comments" -d "$PAYLOAD" >/dev/null
+          else
+            CREATE=$(jq -nc --arg t "$TITLE" --arg b "$BODY" '{title:$t,body:$b}')
+            curl -fsSL -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/issues" -d "$CREATE" >/dev/null
+          fi
+          exit 0

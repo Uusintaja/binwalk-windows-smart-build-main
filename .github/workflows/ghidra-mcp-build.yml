@@ -35,6 +35,16 @@ env:
   GHIDRA_VERSION: 12.1.3
   GHIDRA_DATE: 20260817
 
+  GHIDRA_LIBS: >-
+    Features/Base/lib/Base.jar
+    Features/Decompiler/lib/Decompiler.jar
+    Framework/Docking/lib/Docking.jar
+    Framework/Generic/lib/Generic.jar
+    Framework/Project/lib/Project.jar
+    Framework/SoftwareModeling/lib/SoftwareModeling.jar
+    Framework/Utility/lib/Utility.jar
+    Framework/Gui/lib/Gui.jar
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -197,11 +207,20 @@ jobs:
 
       - name: Copy Ghidra libs
         run: |
+          set -euo pipefail
+      
           mkdir -p ./lib
-          for libfile in ${{ env.GHIDRA_LIBS }}
-            do echo "Copying ${libfile} to lib/"
-            cp ghidra_${{ env.GHIDRA_VERSION }}_PUBLIC/Ghidra/${libfile} ./lib/
+          GHIDRA_DIR=$(ls -d ghidra_${{ env.GHIDRA_VERSION }}_PUBLIC*)
+      
+          echo "Ghidra directory: ${GHIDRA_DIR}"
+      
+          for libfile in ${{ env.GHIDRA_LIBS }}; do
+            echo "Copying ${libfile} to lib/"
+            cp "${GHIDRA_DIR}/Ghidra/${libfile}" ./lib/
           done
+      
+          echo "=== Ghidra libraries ==="
+          ls -lh ./lib/
 
       - name: Patch extension.properties
         run: |
